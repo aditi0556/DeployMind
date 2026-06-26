@@ -2,6 +2,7 @@ from pydantic import BaseModel,Field
 from typing import List
 from google.adk.agents.llm_agent import LlmAgent
 from tools.github_agent import RepoInputSchema,RepoAnalysisOutput
+from config import SMART_MODEL
 class LogAnalysisOutput(BaseModel):
     analysis: str = Field(
         description=(
@@ -41,7 +42,7 @@ class LogAnalysisInput(BaseModel):
     )
 
 log_analysis_agent=LlmAgent(
-    model = 'gemini-2.5-flash',
+    model = SMART_MODEL,
     name = 'log_analysis_agent',
     instruction = """
         You are a Deployment Log Analysis Agent.

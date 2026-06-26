@@ -10,6 +10,7 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
 from mcp import StdioServerParameters
 from pydantic import BaseModel,Field
 from typing import Optional,List,Dict
+from config import FAST_MODEL, SMART_MODEL
 # Load environment variables from .env file in the parent directory
 # Place this near the top, before using env vars like API keys
 # load_dotenv('../.env')
@@ -77,16 +78,16 @@ async def create_github_agent(GITHUB_TOKEN:str):
         # Use StdioConnectionParams for local process communication
         connection_params=StdioConnectionParams(
             server_params = StdioServerParameters(
-                command='npx', # Command to run the server
-                args=["-y",    # Arguments for the command
-                    "@modelcontextprotocol/server-github",
-                    GITHUB_TOKEN],
+                command='npx',
+                args=["-y", "@modelcontextprotocol/server-github"],
+                # The server reads the token from this env var (NOT a CLI arg).
+                env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": GITHUB_TOKEN},
             ),
         ),
     )
 
     repo_agent = LlmAgent(
-        model = 'gemini-2.5-flash',
+        model = FAST_MODEL,
         name = 'repo_analysis_agent',
         instruction="""
             You are a Repository Analysis Agent.
@@ -161,16 +162,14 @@ async def create_file_retrieval_agent(github_token: str):
         connection_params=StdioConnectionParams(
             server_params=StdioServerParameters(
                 command="npx",
-                args=[
-                    "-y",
-                    "@modelcontextprotocol/server-github",
-                    github_token,
-                ],
+                args=["-y", "@modelcontextprotocol/server-github"],
+                # The server reads the token from this env var (NOT a CLI arg).
+                env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": github_token},
             ),
         ),
     )
     file_agent = LlmAgent(
-        model="gemini-2.5-flash",
+        model=FAST_MODEL,
         name="github_file_retrieval_agent",
         instruction="""
             You are a GitHub File Retrieval Agent.
@@ -199,3 +198,97 @@ async def create_file_retrieval_agent(github_token: str):
     )
 
     return toolset, file_agent
+
+
+# ---------------------------------------------------------------------------
+# Session 8: applying a fix back to the repository (write mode)
+# ---------------------------------------------------------------------------
+
+class FileChange(BaseModel):
+    file_path: str = Field(description="Repository-relative path of the file to change")
+    new_content: str = Field(
+        description="Full new content of the file after the fix is applied"
+    )
+    change_summary: str = Field(
+        description="One-line explanation of what changed in this file and why"
+    )
+
+
+class FixApplyInput(BaseModel):
+    github_owner: str = Field(description="GitHub username or organization")
+    repository_name: str = Field(description="Repository name")
+    base_branch: str = Field(default="main", description="Branch to branch off from")
+    new_branch: str = Field(description="Name of the new branch to create for the fix")
+    commit_message: str = Field(description="Commit message for the fix")
+    pr_title: str = Field(description="Title for the pull request")
+    pr_body: str = Field(description="Body/description for the pull request")
+    file_changes: List[FileChange] = Field(
+        description="Files to create or update with their full new contents"
+    )
+
+
+class FixApplyOutput(BaseModel):
+    success: bool = Field(description="Whether the fix was pushed successfully")
+    branch: Optional[str] = Field(default=None, description="Branch the fix was pushed to")
+    pull_request_url: Optional[str] = Field(
+        default=None, description="URL of the opened pull request, if any"
+    )
+    applied_files: List[str] = Field(
+        default_factory=list, description="File paths that were created or updated"
+    )
+    message: str = Field(description="Human-readable summary of the result")
+
+
+async def create_github_fix_agent(github_token: str):
+    """Creates a WRITE-ENABLED GitHub agent that pushes an approved fix.
+
+    Unlike the read-only repo/file agents, this one is permitted to create a
+    branch, commit the changed files, and open a pull request. It must NEVER
+    push directly to the base branch and must NEVER delete files.
+    """
+    toolset = McpToolset(
+        connection_params=StdioConnectionParams(
+            server_params=StdioServerParameters(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-github"],
+                # The server reads the token from this env var (NOT a CLI arg).
+                env={**os.environ, "GITHUB_PERSONAL_ACCESS_TOKEN": github_token},
+            ),
+        ),
+    )
+    fix_apply_agent = LlmAgent(
+        model=SMART_MODEL,
+        name="github_fix_apply_agent",
+        instruction="""
+            You are a GitHub Fix Apply Agent.
+            Your responsibility is to safely push an APPROVED fix to a repository.
+
+            Input contains:
+            - github_owner, repository_name
+            - base_branch (the branch to start from)
+            - new_branch (the branch you must create for the fix)
+            - commit_message, pr_title, pr_body
+            - file_changes: a list of files with their FULL new contents
+
+            Tasks (in this exact order):
+            1. Create the new branch `new_branch` from `base_branch`.
+            2. For each entry in file_changes, create or update that file on the
+               new branch with the EXACT contents provided in new_content.
+            3. Open a pull request from `new_branch` into `base_branch` using
+               pr_title and pr_body.
+
+            Hard safety rules:
+            - NEVER commit directly to the base branch.
+            - NEVER delete files.
+            - NEVER modify files that are not listed in file_changes.
+            - Write file contents EXACTLY as provided. Do not reformat or "improve".
+            - If any step fails, set success=false and explain in `message`.
+
+            Return only data matching FixApplyOutput, including the pull request
+            URL when one is created.
+            """,
+        input_schema=FixApplyInput,
+        output_schema=FixApplyOutput,
+        tools=[toolset],
+    )
+    return toolset, fix_apply_agent
